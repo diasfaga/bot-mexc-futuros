@@ -1,159 +1,167 @@
-
-import requests
+import os
+import time
 import hmac
 import hashlib
-import time
-import json
-from flask import Flask, request
-import os
-from dotenv import load_dotenv
 import threading
-
-load_dotenv()
-
-API_KEY = os.getenv('MEXC_API_KEY')
-API_SECRET = os.getenv('MEXC_API_SECRET')
-BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-BASE_URL = 'https://contract.mexc.com'
-
-ALAVANCAGEM = 5
-PERCENTUAL_DO_SALDO = float(os.getenv('PERCENTUAL_CAPITAL', 0.05))
-TAKE_PROFIT = float(os.getenv('TAKE_PROFIT', 0.02))
-STOP_LOSS = float(os.getenv('STOP_LOSS', 0.10))
-TEMPO_CANCELAMENTO = int(os.getenv('TEMPO_CANCELAMENTO_MINUTOS', 5))
+import requests
+import pandas as pd
+from datetime import datetime
+from flask import Flask, request
 
 app = Flask(__name__)
 
-def enviar_mensagem(texto):
+# Variáveis de ambiente
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+MEXC_API_KEY = os.getenv("MEXC_API_KEY")
+MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.01"))        # 1%
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10%
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.10"))    # 10%
+CANCEL_MINUTES = int(os.getenv("CANCEL_MINUTES", "5"))
+
+symbols = [
+    'SAGAUSDT', 'ACEUSDT', 'PORTALUSDT', 'HIFIUSDT', 'ALTUSDT', 'ONIUSDT',
+    'IMXUSDT', 'FLOKIUSDT', 'MAGICUSDT', 'DYDXUSDT', 'RNDRUSDT'
+]
+
+def send_message(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": texto}
-    requests.post(url, json=payload)
+    payload = {"chat_id": CHAT_ID, "text": msg}
+    try:
+        requests.post(url, json=payload)
+    except:
+        pass
 
-def assinatura(params):
-    query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-    return hmac.new(API_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+def signature(payload, secret_key):
+    query = '&'.join([f"{k}={v}" for k, v in sorted(payload.items())])
+    return hmac.new(secret_key.encode(), query.encode(), hashlib.sha256).hexdigest()
 
-def requisicao(endpoint, params=None, method='GET'):
-    if params is None:
-        params = {}
-    params['timestamp'] = int(time.time() * 1000)
-    params['apiKey'] = API_KEY
-    params['signature'] = assinatura(params)
+def buscar_candles(symbol, interval, limit=100):
+    url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    try:
+        response = requests.get(url)
+        df = pd.DataFrame(response.json())
+        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume'] + list(range(6, len(df.columns)))
+        df['close'] = df['close'].astype(float)
+        return df
+    except:
+        return None
 
-    headers = {'Content-Type': 'application/json'}
-    url = f"{BASE_URL}{endpoint}"
+def calcular_rsi(df, period=14):
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-    if method == 'GET':
-        return requests.get(url, params=params, headers=headers).json()
-    elif method == 'POST':
-        return requests.post(url, json=params, headers=headers).json()
-    elif method == 'DELETE':
-        return requests.delete(url, params=params, headers=headers).json()
-
-def buscar_preco_atual(symbol):
-    url = f"https://contract.mexc.com/api/v1/contract/price/{symbol}"
-    response = requests.get(url)
-    if response.ok:
-        return float(response.json()['data']['lastPrice'])
-    return None
-
-def buscar_saldo():
-    resposta = requisicao('/api/v1/private/account/assets')
-    for item in resposta.get('data', []):
-        if item['currency'] == 'USDT':
-            return float(item['availableBalance'])
-    return None
-
-def enviar_ordem_limit(symbol, quantidade, preco):
-    params = {
+def criar_ordem_limit(symbol, qty, entry_price):
+    endpoint = "https://api.mexc.com/api/v1/private/order/place"
+    ts = str(int(time.time() * 1000))
+    order_data = {
         "symbol": symbol,
-        "price": round(preco, 4),
-        "vol": round(quantidade, 3),
-        "side": 1,
-        "type": 1,
-        "openType": 2,
+        "price": entry_price,
+        "vol": qty,
+        "side": 1,  # Buy
+        "type": 1,  # Limit
+        "open_type": "cross",
         "positionId": 0,
-        "leverage": ALAVANCAGEM
+        "leverage": 5,
+        "externalOid": f"oid_{ts}",
+        "timestamp": ts
     }
-    return requisicao('/api/v1/private/order/submit', params, method='POST')
-
-def criar_ordens_tp_sl(symbol, volume, preco_entrada):
-    preco_tp = round(preco_entrada * (1 + TAKE_PROFIT), 4)
-    preco_sl = round(preco_entrada * (1 - STOP_LOSS), 4)
-
-    ordem_tp = {
-        "symbol": symbol,
-        "price": preco_tp,
-        "vol": volume,
-        "side": 2,
-        "type": 1,
-        "openType": 2,
-        "positionId": 0,
-        "leverage": ALAVANCAGEM
+    order_data["sign"] = signature(order_data, MEXC_SECRET_KEY)
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "ApiKey": MEXC_API_KEY
     }
+    response = requests.post(endpoint, data=order_data, headers=headers)
+    return response.json()
 
-    ordem_sl = {
-        "symbol": symbol,
-        "price": preco_sl,
-        "vol": volume,
-        "side": 2,
-        "type": 1,
-        "openType": 2,
-        "positionId": 0,
-        "leverage": ALAVANCAGEM
+def criar_ordem_oco(symbol, qty, entry_price):
+    tp_price = round(entry_price * (1 + TP_PERCENT), 6)
+    sl_price = round(entry_price * (1 - SL_PERCENT), 6)
+    send_message(f"🎯 Criando TP: {tp_price} | 🛑 SL: {sl_price}")
+    # MEXC não tem OCO nativo em futuros, vamos simular com duas ordens LIMIT
+
+    # TP
+    criar_ordem_limit(symbol, qty, tp_price)
+
+    # SL
+    criar_ordem_limit(symbol, qty, sl_price)
+
+def obter_saldo_usdt():
+    endpoint = "https://api.mexc.com/api/v1/private/account/assets"
+    ts = str(int(time.time() * 1000))
+    payload = {
+        "timestamp": ts
     }
+    payload["sign"] = signature(payload, MEXC_SECRET_KEY)
+    headers = {"ApiKey": MEXC_API_KEY}
+    try:
+        r = requests.get(endpoint, params=payload, headers=headers)
+        data = r.json()
+        for coin in data.get("data", []):
+            if coin["currency"] == "USDT":
+                return float(coin["availableBalance"])
+    except:
+        return 0
 
-    requisicao('/api/v1/private/order/submit', ordem_tp, method='POST')
-    requisicao('/api/v1/private/order/submit', ordem_sl, method='POST')
+def analisar_symbol(symbol):
+    for timeframe in ['5m', '15m']:
+        df = buscar_candles(symbol, timeframe)
+        if df is not None and not df.empty:
+            rsi = calcular_rsi(df).iloc[-1]
+            preco = df['close'].iloc[-1]
 
-    enviar_mensagem(f"🎯 TP em {preco_tp} | 🛡 SL em {preco_sl}")
+            if rsi <= 30:
+                send_message(f"🟢 COMPRA: {symbol} [{timeframe}] | RSI: {rsi:.2f} | Preço: {preco}")
+                emitir_alerta_sonoro()
+                enviar_ordem(symbol, preco)
 
-def cancelar_ordem(orderId):
-    return requisicao('/api/v1/private/order/cancel', {"orderId": orderId}, method='DELETE')
+def emitir_alerta_sonoro():
+    try:
+        import winsound
+        winsound.Beep(1000, 300)
+    except:
+        pass
 
-def monitorar_ordem(orderId, symbol, quantidade, preco_entrada):
-    inicio = time.time()
-    while True:
-        if time.time() - inicio > TEMPO_CANCELAMENTO * 60:
-            cancelar_ordem(orderId)
-            enviar_mensagem("⏳ Ordem cancelada por tempo!")
-            break
-        time.sleep(10)
+def enviar_ordem(symbol, preco_entrada):
+    saldo = obter_saldo_usdt()
+    valor_total = saldo * RISK_PERCENT
+    qty = round((valor_total * 5) / preco_entrada, 2)
+    resultado = criar_ordem_limit(symbol, qty, preco_entrada)
+    send_message(f"📥 Ordem enviada: {symbol} | Qtd: {qty} | Preço: {preco_entrada}")
 
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    update = request.get_json()
-    if 'message' in update:
-        texto = update['message'].get('text', '')
-        if texto == '/start':
-            enviar_mensagem("✅ Bot iniciado e pronto para operar!")
-        elif texto == '/status':
-            enviar_mensagem("📊 Bot ativo e monitorando sinais!")
-    return {'ok': True}
-
-@app.route('/')
-def home():
-    return '✅ Bot de Futuros MEXC Online!'
+    # Cria TP e SL após 2s
+    time.sleep(2)
+    criar_ordem_oco(symbol, qty, preco_entrada)
 
 def loop_sinais():
     while True:
-        symbol = "APT_USDT"  # Substitua por sua lógica de sinal real
-        preco_atual = buscar_preco_atual(symbol)
-        if preco_atual:
-            saldo = buscar_saldo()
-            if saldo:
-                valor_usado = saldo * PERCENTUAL_DO_SALDO
-                preco_entrada = round(preco_atual * 0.999, 4)
-                quantidade = valor_usado / preco_entrada
-                resposta = enviar_ordem_limit(symbol, quantidade, preco_entrada)
-                if resposta.get('code') == 0:
-                    orderId = resposta['data']['orderId']
-                    enviar_mensagem(f"🚀 Ordem LIMIT enviada para {symbol} a {preco_entrada}")
-                    threading.Thread(target=monitorar_ordem, args=(orderId, symbol, quantidade, preco_entrada)).start()
-                    criar_ordens_tp_sl(symbol, quantidade, preco_entrada)
+        for symbol in symbols:
+            try:
+                analisar_symbol(symbol)
+            except Exception as e:
+                send_message(f"Erro analisando {symbol}: {e}")
         time.sleep(300)
+
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if "message" in data:
+        texto = data["message"].get("text", "")
+        if texto == "/start":
+            send_message("✅ Bot iniciado! Monitorando Altcoins 🚀")
+        elif texto == "/status":
+            send_message("📡 Bot rodando e aguardando sinais!")
+    return {"ok": True}
+
+@app.route("/")
+def index():
+    return "Bot de Futuros MEXC - Online 🚀"
 
 if __name__ == "__main__":
     threading.Thread(target=loop_sinais).start()
