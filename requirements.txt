@@ -2,3 +2,4 @@ requests
 python-dotenv
 flask
 pandas
+websocket-client
