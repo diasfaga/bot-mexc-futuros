@@ -1,3 +1,4 @@
+
 import os
 import time
 import hmac
@@ -8,7 +9,7 @@ from flask import Flask, request
 from datetime import datetime
 import threading
 
-# === Variáveis do ambiente ===
+# Variáveis de ambiente (.env no Railway)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 API_KEY = os.getenv("MEXC_API_KEY")
@@ -23,77 +24,25 @@ SYMBOLS = ['ALTUSDT', 'SAGAUSDT', 'ACEUSDT']
 
 app = Flask(__name__)
 
-# === Funções Telegram ===
-def telegram(texto):
-    try:
-        requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": CHAT_ID, "text": texto})
-    except Exception as e:
-        print(f"[ERRO TELEGRAM] {e}")
+def telegram(text):
+    requests.post(f"{BASE_URL}/sendMessage", json={"chat_id": CHAT_ID, "text": text})
 
-# === MEXC: Assinar requisição ===
 def assinar(params):
     query = '&'.join([f"{k}={v}" for k, v in params.items()])
     signature = hmac.new(SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
     return f"{query}&signature={signature}"
 
-# === Buscar preço atual ===
-def buscar_preco(symbol):
-    try:
-        url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval=1m&limit=2"
-        df = pd.DataFrame(requests.get(url).json())
-        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume'] + list(range(6, len(df.columns)))
-        df['close'] = df['close'].astype(float)
-        return df['close'].iloc[-1]
-    except Exception as e:
-        print(f"[ERRO PREÇO] {symbol}: {e}")
-        return None
-
-# === Calcular RSI ===
-def calcular_rsi(symbol, interval='5m'):
-    try:
-        url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
-        df = pd.DataFrame(requests.get(url).json())
-        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume'] + list(range(6, len(df.columns)))
-        df['close'] = df['close'].astype(float)
-        delta = df['close'].diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(window=14).mean()
-        avg_loss = loss.rolling(window=14).mean()
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.iloc[-1]
-    except Exception as e:
-        print(f"[ERRO RSI] {symbol}: {e}")
-        return None
-
-# === Buscar saldo em USDT ===
-def buscar_saldo():
-    try:
-        url = "https://api.mexc.com/api/v1/private/account/assets"
-        params = {"timestamp": int(time.time() * 1000)}
-        signed = assinar(params)
-        headers = {"ApiKey": API_KEY}
-        response = requests.get(url, headers=headers, params=signed)
-        ativos = response.json()['data']
-        usdt = next((a for a in ativos if a['currency'] == 'USDT'), None)
-        return float(usdt['available_balance']) if usdt else 0.0
-    except Exception as e:
-        print(f"[ERRO SALDO] {e}")
-        return 0.0
-
-# === Enviar ordem LIMIT na MEXC Futuros ===
 def enviar_ordem_limit(symbol, side, quantity, price):
-    url = "https://api.mexc.com/api/v1/private/order/submit_order"  # CORRIGIDO
+    url = "https://contract.mexc.com/api/v1/private/order/submit"
     timestamp = int(time.time() * 1000)
 
     params = {
         "symbol": symbol,
         "price": str(price),
         "vol": str(quantity),
-        "side": side,  # 1 = buy, 2 = sell
-        "type": "1",   # 1 = Limit
-        "open_type": "1",  # 1 = cross
+        "side": side,
+        "type": "1",
+        "open_type": "1",
         "leverage": "5",
         "position_id": "0",
         "external_oid": f"bot_{timestamp}",
@@ -111,17 +60,55 @@ def enviar_ordem_limit(symbol, side, quantity, price):
     response = requests.post(url, headers=headers, data=signed)
     return response.json()
 
-# === Lógica do sinal ===
+def buscar_preco(symbol):
+    try:
+        url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval=1m&limit=2"
+        df = pd.DataFrame(requests.get(url).json())
+        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume'] + list(range(6, len(df.columns)))
+        df['close'] = df['close'].astype(float)
+        return df['close'].iloc[-1]
+    except Exception as e:
+        telegram(f"Erro buscar_preco {symbol}: {e}")
+        return None
+
+def calcular_rsi(symbol, interval='5m'):
+    try:
+        url = f"https://api.mexc.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
+        df = pd.DataFrame(requests.get(url).json())
+        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume'] + list(range(6, len(df.columns)))
+        df['close'] = df['close'].astype(float)
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1]
+    except Exception as e:
+        telegram(f"Erro calcular_rsi {symbol}: {e}")
+        return None
+
+def buscar_saldo():
+    url = "https://contract.mexc.com/api/v1/private/account/assets"
+    params = {"timestamp": int(time.time() * 1000)}
+    signed = assinar(params)
+    headers = {"ApiKey": API_KEY}
+    response = requests.get(url, headers=headers, params=signed)
+    try:
+        ativos = response.json()['data']
+        usdt = next((a for a in ativos if a['currency'] == 'USDT'), None)
+        return float(usdt['available_balance']) if usdt else 0.0
+    except Exception as e:
+        telegram(f"[ERRO SALDO] {e}")
+        return 0.0
+
 def processar_sinal(symbol):
     preco = buscar_preco(symbol)
-    if preco is None:
-        telegram(f"⚠️ Preço indisponível para {symbol}")
-        return
+    if not preco: return
 
     rsi = calcular_rsi(symbol)
-    if rsi is None:
-        telegram(f"⚠️ RSI indisponível para {symbol}")
-        return
+    if not rsi: return
 
     if rsi <= 30:
         saldo = buscar_saldo()
@@ -131,18 +118,18 @@ def processar_sinal(symbol):
         tp = round(preco * (1 + TP_PERCENT), 6)
         sl = round(preco * (1 - SL_PERCENT), 6)
 
-        resp = enviar_ordem_limit(symbol, "1", qtd, preco)  # apenas LONG
+        resp = enviar_ordem_limit(symbol, "1", qtd, preco)
 
         mensagem = (
             f"🟢 SINAL LONG: {symbol}\n"
-            f"RSI: {rsi:.2f}\nPreço: {preco}\nQtd: {qtd}\n\n"
+            f"RSI: {rsi:.2f}\nPreço: {preco}\n"
+            f"Qtd: {qtd}\n\n"
             f"🎯 TP: {tp}\n🛑 SL: {sl}\n\n"
             f"Ordem: {resp}"
         )
         telegram(mensagem)
         print(mensagem)
 
-# === Rotas Flask ===
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     update = request.get_json()
@@ -156,9 +143,8 @@ def webhook():
 
 @app.route("/")
 def home():
-    return "Bot MEXC ativo!"
+    return "Bot MEXC ativo! 🚀"
 
-# === Iniciar loop ===
 def iniciar_bot():
     while True:
         for symbol in SYMBOLS:
@@ -166,7 +152,7 @@ def iniciar_bot():
                 processar_sinal(symbol)
             except Exception as e:
                 telegram(f"Erro processando {symbol}: {e}")
-        time.sleep(300)  # 5 minutos
+        time.sleep(300)
 
 if __name__ == "__main__":
     threading.Thread(target=iniciar_bot).start()
